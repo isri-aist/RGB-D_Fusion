@@ -9,7 +9,7 @@ public class RGBDImmersion : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		CppStandard = CppStandardVersion.Cpp17;
 
-        	PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "rclUE", "UMG", "RHI", "RenderCore", "zlib", "LibJpegTurbo", "libtiff", "OpenCV", "OpenCVHelper", "GeometryFramework" });
+        	PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "rclUE", "UMG", "RHI", "RenderCore", "zlib", "LibJpegTurbo", "libtiff", "OpenCV", "OpenCVHelper", "GeometryCore",  "GeometryFramework", "MeshDescription" });
         	
         	PublicIncludePaths.Add("/home/raphael/Downloads/Linux_Unreal_Engine_5.1.0/Engine/Plugins/Runtime/OpenCV/Source/ThirdParty/OpenCV/include");
         	PublicIncludePaths.Add("/usr/include");

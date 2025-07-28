@@ -7,11 +7,14 @@
 #include "Components/DynamicMeshComponent.h"
 #include "Components/Slider.h"
 #include "Components/CheckBox.h"
+#include "Components/TextBlock.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Containers/Queue.h"
 #include "DynamicMeshActor.h"
+#include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <atomic>
 
@@ -21,6 +24,7 @@
 // rclUE
 #include "ROS2Subscriber.h"
 #include <Msgs/ROS2Img.h>
+#include <Msgs/ROS2Imu.h>
 
 #include "ROS2SubscriberNode.generated.h"
 
@@ -44,6 +48,8 @@ public:
     void DepthCallback(const UROS2GenericMsg* InMsg);
     UFUNCTION()
     void IRCallback(const UROS2GenericMsg* InMsg);
+	UFUNCTION()
+	void IMUCallback(const UROS2GenericMsg* InMsg);
 
 	// Topics used to get the RGB, Depth and IR images
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
@@ -54,6 +60,8 @@ public:
     FString DepthTopicName = TEXT("k4a/depth/image_raw");
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     FString IRTopicName = TEXT("k4a/ir/image_raw");
+	UPROPERTY(EditAnywhere, BlueprintReadWrite)
+	FString IMUTopicName = TEXT("k4a/imu");
 
 	// Information about the Images
     UPROPERTY()
@@ -73,7 +81,7 @@ public:
     UTexture2D* IR;
 	
 	// Values of the UI
-	float LastBlendValue = 0;
+	float LastBlendValue = 0, LastLatency = 0;
 	bool LastMultiView = false, LastRGBView = false, LastDepthView = false, LastIRView = false, LastDepthSimu = true;
 	// UI Elements
 	UPROPERTY()
@@ -90,6 +98,12 @@ public:
 	UCheckBox* DepthSimu = nullptr;
 	UPROPERTY()
 	UCheckBox* TpCenter = nullptr;
+	UPROPERTY()
+	UCheckBox* FixView = nullptr;
+	UPROPERTY()
+	USlider* LatencySlider = nullptr;
+	UPROPERTY()
+	UTextBlock* LatencyText = nullptr;
 
 	// Modifiable element of the Dynamic mesh Blueprint
 	FObjectProperty* TextureProp;
@@ -98,30 +112,39 @@ public:
 	// Stores the Current User Pawn
 	UPROPERTY()
 	APawn* PlayerPawn;
+	TArray<float> maxDistance;
 
 	// Define the function used in the thread to fill depth
     UFUNCTION()
     void InpaintDepth();
 	std::thread InpaintThread;
+	std::mutex QueueMutex;
+	std::condition_variable QueueCV;
     std::atomic<bool> bStopThread{false};
 	// Queues used to send information to and from the thread
     TQueue<TArray<uint8>, EQueueMode::Mpsc> MsgQueue;
     TQueue<TSharedPtr<TArray<uint8>>, EQueueMode::Mpsc> MsgQueue2;
     TQueue<TSharedPtr<TArray<uint8>>, EQueueMode::Mpsc> DataQueue;
-    TQueue<TSharedPtr<TArray<uint8>>, EQueueMode::Mpsc> DepthQueue;
-    TQueue<size_t, EQueueMode::Mpsc> TotalQueue;
 
 	// Store the Dynamic Material and a reference Material used to change the Texture during Runtime
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterialInstance;
 	UPROPERTY(EditAnywhere, Category = "Dynamic")
 	UMaterialInterface* BaseMaterial;
+	
 
 	// Store the Dynamic Mesh Object
 	UPROPERTY(EditAnywhere, Category = "ROS2")
 	ADynamicMeshActor* DynamicMeshActor;
     UPROPERTY()
     UDynamicMeshComponent* DynamicMesh;
+
+	FTimespan Latency = FTimespan(0); // 10000000 = 1s
+	FDateTime LatencyTime = FDateTime(1, 1, 1);
+	TQueue<FVector> CamLocations;
+	TQueue<FVector> SpringLocations;
+	TQueue<FRotator> CamRotations;
+	FRotator CamAbsoluteRotation = FRotator(0, 0, 0);
 
 	// Name of the different modifiable parameters of the Dynamic Material
     FName TextureParameterName = FName("Tex");

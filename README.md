@@ -14,7 +14,7 @@ This project uses a variety of sensor data to perform multiple operations, inclu
 - Depth Simulation using Displacement
 - A User Interface to control the view
 
-## Requierements
+## Requirements
 
 This project has been tested in a specific environment:
 

@@ -9,10 +9,13 @@
 #include "Kismet/GameplayStatics.h"
 #include "UObject/UnrealType.h"
 #include <fstream>
+
+#include "HeadMountedDisplayTypes.h"
 #include "Components/WidgetComponent.h"
 #include "tiffio.h"
 #include "Blueprint/UserWidget.h"
 #include "Camera/CameraComponent.h"
+#include "GameFramework/SpringArmComponent.h"
 
 // OpenCV
 #ifdef check
@@ -22,8 +25,6 @@
 #include <opencv2/photo.hpp>
 #endif
 
-
-
 /*----------------------------------------------------------------*/
 //			 			        Useful Functions 				            //
 /*----------------------------------------------------------------*/
@@ -32,9 +33,22 @@ void AROS2SubscriberNode::InpaintDepth() {
    {
       if (!MsgQueue.IsEmpty())
       {
+         std::unique_lock<std::mutex> lock(QueueMutex);
+         QueueCV.wait(lock, [this]() {
+             return !MsgQueue.IsEmpty() || bStopThread;
+         });
+
+         if (bStopThread) break;
+         
          // Acquire ROS2 Message
          TArray<uint8> Msg;
          MsgQueue.Dequeue(Msg);
+         MsgQueue.Empty();
+         lock.unlock();
+		if (Msg.Num() < HeightDepth * WidthDepth * sizeof(float)) {
+    		UE_LOG(LogTemp, Error, TEXT("Taille de message incorrecte pour profondeur"));
+    		continue;
+		}
          cv::Mat a(HeightDepth, WidthDepth, CV_32FC1, Msg.GetData()); // Create custom OpenCV Material
 
          cv::Mat inpainted, output_inv;
@@ -165,39 +179,36 @@ void AROS2SubscriberNode::InpaintDepth() {
          cv::Mat smooth;
          cv::medianBlur(inpainted, smooth, 3);
          smooth.copyTo(inpainted, border_mask);
-         
-         // Remap the scale
-         float min_old = -1.0f;   // Current range
-         float max_old =  9.0f;
 
-         float min_new =  0.0f;   // Wanted range
-         float max_new =  5.0f;
+         double min, max;
+         cv::minMaxLoc(smooth, &min, &max);
+         
+         for (cv::MatIterator_<float> it = smooth.begin<float>(), it_end = smooth.end<float>(); it != it_end; ++it) {
+            if (*it == 0.0f) *it = max; // X est ta valeur de remplacement
+         }
 
          // Clamp
          cv::Mat clipped;
-         cv::threshold(smooth, clipped, max_old, max_old, cv::THRESH_TRUNC);     // Max clamp
-         cv::threshold(clipped, clipped, min_old, min_old, cv::THRESH_TOZERO);      // Min clamp
+         cv::threshold(smooth, clipped, max, max, cv::THRESH_TRUNC);     // Max clamp
+         cv::threshold(clipped, clipped, min, min, cv::THRESH_TOZERO);      // Min clamp
 
-         cv::Mat remapped;
-         clipped.convertTo(remapped, CV_32F, (max_new - min_new) / (max_old - min_old), 
-                                             min_new - min_old * (max_new - min_new) / (max_old - min_old));
-         
+
          if(DataQueue.IsEmpty() || MsgQueue2.IsEmpty()){
             // Full Data and optimisations sent to the Displacement Node
-            int dataSize = remapped.total() * remapped.elemSize();
+            int dataSize = clipped.total() * clipped.elemSize();
             TSharedPtr<TArray<uint8>> DataCopy = MakeShared<TArray<uint8>>();
             DataCopy->AddUninitialized(dataSize);
-            FMemory::Memcpy(DataCopy->GetData(), remapped.data, dataSize);
+            FMemory::Memcpy(DataCopy->GetData(), clipped.data, dataSize);
             if(DataQueue.IsEmpty()){
                DataQueue.Enqueue(DataCopy);
                bPendingDepthUpdate = true;
             }
 
             // Data before remap sent to the RGB for transformation of color image in depth frame
-            int dataSize2 = inpainted.total() * inpainted.elemSize();
+            int dataSize2 = clipped.total() * clipped.elemSize();
             TSharedPtr<TArray<uint8>> DataCopy2 = MakeShared<TArray<uint8>>();
             DataCopy2->AddUninitialized(dataSize2);
-            FMemory::Memcpy(DataCopy2->GetData(), inpainted.data, dataSize2);
+            FMemory::Memcpy(DataCopy2->GetData(), clipped.data, dataSize2);
             if(MsgQueue2.IsEmpty()) {
                MsgQueue2.Enqueue(DataCopy2);
             }
@@ -205,6 +216,44 @@ void AROS2SubscriberNode::InpaintDepth() {
        }
     }
 } // Fill the depth
+cv::Mat WarpFromCameraToEye(const cv::Mat& rgb, const cv::Mat& depth,
+                                float fx, float fy, float cx, float cy,
+                                const cv::Matx33f& R, const cv::Vec3f& t)
+{
+   cv::Mat output(rgb.size(), rgb.type(), cv::Scalar::all(0));
+
+   for (int v = 0; v < rgb.rows; ++v)
+   {
+      for (int u = 0; u < rgb.cols; ++u)
+      {
+         float Z = depth.at<uint16>(v, u) * 0.001f; // Kinect depth in mm → m
+         if (Z <= 0.1f || Z > 5.0f) continue; // skip invalid depths
+
+         // Back-project pixel to 3D (in camera space)
+         float X = (u - cx) * Z / fx;
+         float Y = (v - cy) * Z / fy;
+         cv::Vec3f P_cam(X, Y, Z);
+
+         // Transform to eye space
+         cv::Vec3f P_eye = R * P_cam + t;
+
+         // Project to 2D (same intrinsics, assuming eye uses same camera model)
+         float u_eye = (P_eye[0] * fx / P_eye[2]) + cx;
+         float v_eye = (P_eye[1] * fy / P_eye[2]) + cy;
+
+         if (u_eye >= 0 && u_eye < rgb.cols && v_eye >= 0 && v_eye < rgb.rows)
+         {
+            // Bilinear interpolation optional; here we just round
+            int u_e = static_cast<int>(u_eye);
+            int v_e = static_cast<int>(v_eye);
+
+            output.at<cv::Vec4b>(v_e, u_e) = rgb.at<cv::Vec4b>(v, u);
+         }
+      }
+   }
+
+   return output;
+}
 void SaveTextureToPNG(UTexture2D* Texture, const FString& Filename)
 {
 	if (!Texture) return;
@@ -335,7 +384,6 @@ void AROS2SubscriberNode::BeginPlay()
    // Located at ~/Documents/Unreal Project/<Project name>/calibration.txt
    FString AbsolutePath = FPaths::ProjectDir()+ "calibration.txt";
    std::ifstream rfile(*AbsolutePath, std::ios::binary);
-
    if (rfile.is_open())
    {
       std::vector<uint8> calibFile;
@@ -347,200 +395,286 @@ void AROS2SubscriberNode::BeginPlay()
       // Initialise the calibration and transformation object from Azure SDK for RGB image transformation
       calib = k4a::calibration::get_from_raw(calibFile, K4A_DEPTH_MODE_WFOV_UNBINNED, K4A_COLOR_RESOLUTION_1536P);
       transformation = k4a::transformation(calib);
-
+      
       // Create all the Subscriber used to get the RGB, Depth and IR Stream
       ROS2_CREATE_SUBSCRIBER(Node, this, RGBTopicName, UROS2ImgMsg::StaticClass(), &AROS2SubscriberNode::RGBCallback);
       ROS2_CREATE_SUBSCRIBER(Node, this, DepthTopicName, UROS2ImgMsg::StaticClass(), &AROS2SubscriberNode::DepthCallback);
       ROS2_CREATE_SUBSCRIBER(Node, this, IRTopicName, UROS2ImgMsg::StaticClass(), &AROS2SubscriberNode::IRCallback);
-
+      ROS2_CREATE_SUBSCRIBER(Node, this, IMUTopicName, UROS2ImuMsg::StaticClass(), &AROS2SubscriberNode::IMUCallback);
+      
       // Find dynamic variables of the Dynamic Mesh Blueprint
       TextureProp = FindFProperty<FObjectProperty>(DynamicMeshActor->GetClass(), "Displacement Map");
       IsDepthSimuEnabled = FindFProperty<FBoolProperty>(DynamicMeshActor->GetClass(), "DepthSimu");
 
       // Current Player
       PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
-
+       
       // Start the Thread used by the depth inpainting method to reduce lag
       InpaintThread = std::thread([this]() { InpaintDepth(); });
-      InpaintThread.detach();
+      //InpaintThread.detach();
    }
 }
 void AROS2SubscriberNode::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
    // Stop the thread
    bStopThread = true;
+   QueueCV.notify_all();
    if (InpaintThread.joinable()) {
       InpaintThread.join();
    }
-    
+     
    Super::EndPlay(EndPlayReason);
 }
 void AROS2SubscriberNode::Tick(float DeltaSeconds)
 {
    Super::Tick(DeltaSeconds);
 
-   // If the RGB Texture need to be updated
-   if (bPendingTextureUpdate && DynamicMaterialInstance) {
-      Texture->UpdateResource();
-      DynamicMaterialInstance->SetTextureParameterValue(TextureParameterName, Texture);
-      bPendingTextureUpdate = false;
-   }
-   
-   // If the Depth Texture need to be updated
-   if (bPendingDepthUpdate && DynamicMaterialInstance) {
-      // Empty the queue (used to communicate between the threads)
-      TSharedPtr<TArray<uint8>> DataCopy;
-      if (DataQueue.Dequeue(DataCopy) && DataCopy.IsValid()) {
-         // Update texture
-         void* DepthData = Depth->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
-         FMemory::Memcpy(DepthData, DataCopy->GetData(), DataCopy->Num());
-         Depth->GetPlatformData()->Mips[0].BulkData.Unlock();
+    // If the RGB Texture need to be updated
+    if (bPendingTextureUpdate && DynamicMaterialInstance) {
+       Texture->UpdateResource();
+       DynamicMaterialInstance->SetTextureParameterValue(TextureParameterName, Texture);
+       bPendingTextureUpdate = false;
+    }
+    
+    // If the Depth Texture need to be updated
+    if (bPendingDepthUpdate && DynamicMaterialInstance) {
+       // Empty the queue (used to communicate between the threads)
+       TSharedPtr<TArray<uint8>> DataCopy;
+       if (DataQueue.IsEmpty()) {
+          return;
+       }
+       if (DataQueue.Dequeue(DataCopy) && DataCopy.IsValid()) {
+          // Update texture
+          void* DepthData = Depth->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
+          FMemory::Memcpy(DepthData, DataCopy->GetData(), DataCopy->Num());
+          Depth->GetPlatformData()->Mips[0].BulkData.Unlock();
+    
+          // Assign Texture to the Displacement Node of the Dynamic Mesh Blueprint
+          if (TextureProp) {
+             TextureProp->SetPropertyValue_InContainer(DynamicMeshActor, Depth);
+          }
+          
+          Depth->UpdateResource();
+          DynamicMaterialInstance->SetTextureParameterValue(TextureParameterName2, Depth);
+          DataQueue.Empty();
+          bPendingDepthUpdate = false;
+       }
+    }
+    
+    // If the IR Texture need to be updated
+    if (bPendingIRUpdate && DynamicMaterialInstance) {
+       IR->UpdateResource();
+       DynamicMaterialInstance->SetTextureParameterValue(TextureParameterName3, IR);
+       bPendingIRUpdate = false;
+    }
+    
+    // Get the UI elements OR Update their value
+    if (!Slider || !MultiView || !RGBView || !DepthView || !IRView || !DepthSimu || !TpCenter || !FixView)
+    {
+       if (PlayerPawn)
+       {
+          // Navigate through the Widget of the Pawn to find the UI
+          TArray<UWidgetComponent*> WidgetComponents;
+          PlayerPawn->GetComponents<UWidgetComponent>(WidgetComponents);
+          for (UWidgetComponent* WidgetComp : WidgetComponents)
+          {
+             FString name = WidgetComp->GetName();
+             if (WidgetComp->GetName().Contains(TEXT("Widget")))
+             {
+                UUserWidget* Widget = WidgetComp->GetUserWidgetObject();
+                if (!Widget) continue;
+    
+                // Save all the useful Widgets
+                Slider = Cast<USlider>(Widget->GetWidgetFromName(TEXT("Slider_0")));
+                MultiView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("MultiViewCheckBox")));
+                RGBView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("RGBViewCheckBox")));
+                DepthView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("DepthViewCheckBox")));
+                IRView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("IRViewCheckBox")));
+                DepthSimu = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("DepthSimuCheckBox")));
+                TpCenter = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("TP")));
+                FixView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("Fix")));
+                LatencySlider = Cast<USlider>(Widget->GetWidgetFromName(TEXT("Latency")));
+                LatencyText = Cast<UTextBlock>(Widget->GetWidgetFromName(TEXT("LatencyText")));
+                if (Slider && MultiView && RGBView && DepthView && IRView && DepthSimu && TpCenter && FixView && LatencySlider && LatencyText)
+                {
+                   UE_LOG(LogTemp, Warning, TEXT("All UI Elements Found"));
+                   break;
+                }
+             }
+          }
+       }
+    }
+    else
+    {
+       // Check Slider Value
+       if (Slider && DynamicMaterialInstance) {
+          float Value = Slider->GetValue();
+          // If Value as changed since last time
+          if (LastBlendValue != Value) {
+             // Update the Dynamic Material accordingly to the Slider value
+             DynamicMaterialInstance->SetScalarParameterValue(BlendParameterName, Value);
+             LastBlendValue = Value;
+          }
+       }
+    
+       // Check MultiView Checkbox
+       if (MultiView && DynamicMaterialInstance) {
+          bool Value = MultiView->IsChecked();
+          // If Checked as changed since last time
+          if (LastMultiView != Value) {
+             // Update the Dynamic Material accordingly to the Checkbox state
+             DynamicMaterialInstance->SetScalarParameterValue(MultiViewParameterName, Value);
+             LastMultiView = Value;
+          }
+       }
+    
+       // Check RGB Checkbox
+       if (RGBView && DynamicMaterialInstance) {
+          bool Value = RGBView->IsChecked();
+          // If Checked as changed since last time
+          if (LastRGBView != Value) {
+             // Update the Dynamic Material accordingly to the Checkbox state
+             DynamicMaterialInstance->SetScalarParameterValue(RGBParameterName, Value);
+             LastRGBView = Value;
+          }
+       }
+    
+       // Check Depth Checkbox
+       if (DepthView && DynamicMaterialInstance) {
+          bool Value = DepthView->IsChecked();
+          // If Checked as changed since last time
+          if (LastDepthView != Value) {
+             // Update the Dynamic Material accordingly to the Checkbox state
+             DynamicMaterialInstance->SetScalarParameterValue(DepthParameterName, Value);
+             LastDepthView = Value;
+          }
+       }
+    
+       // Check IR Checkbox
+       if (IRView && DynamicMaterialInstance) {
+          bool Value = IRView->IsChecked();
+          // If Checked as changed since last time
+          if (LastIRView != Value) {
+             // Update the Dynamic Material accordingly to the Checkbox state
+             DynamicMaterialInstance->SetScalarParameterValue(IRParameterName, Value);
+             LastIRView = Value;
+          }
+       }
+    
+       // Check Depth Simulation Checkbox
+       if (DepthSimu && DynamicMaterialInstance) {
+          bool Value = DepthSimu->IsChecked();
+          // If Checked as changed since last time
+          if (LastDepthSimu != Value) {
+             DynamicMaterialInstance->SetScalarParameterValue(DepthSimuParameterName, Value);
+             if (IsDepthSimuEnabled) {
+                // Update the Dynamic Material accordingly to the Checkbox state
+                IsDepthSimuEnabled->SetPropertyValue_InContainer(DynamicMeshActor, Value);
+                if (IsDepthSimuEnabled->GetPropertyValue_InContainer(DynamicMeshActor) == 1) {
+                   DynamicMeshActor->SetActorScale3D(FVector(0.1f, 0.1f, 0.1f));
+                   DynamicMeshActor->SetActorLocation(FVector(-100, 0, 120));
+                } else {
+                   DynamicMeshActor->SetActorScale3D(FVector(0.6f, -0.6f, 0.6f));
+                   DynamicMeshActor->SetActorLocation(FVector(-100, 0, 80));
+                }
+                if (TpCenter)
+                   TpCenter->SetCheckedState(ECheckBoxState::Checked);
+             }
+             LastDepthSimu = Value;
+          }
+       }
+    
+       // Check Teleport to Center Button (Hidden Checkbox)
+       if (TpCenter && DynamicMeshActor) {
+          bool Value = TpCenter->IsChecked();
+          if (Value && PlayerPawn) {
+             // Get the position of the Dynamic Mesh in the Scene
+             FVector MeshPosition = DynamicMeshActor->GetActorLocation();
+    
+             // Get the position of the VR Headset in the Scene
+             TArray<UCameraComponent*> CameraComponents;
+             PlayerPawn->GetComponents<UCameraComponent>(CameraComponents);
+             
+             // Compute the Mesh Position Minus the Camera Position to align the two elements
+             for (UCameraComponent* CameraComp : CameraComponents) {
+                if (IsDepthSimuEnabled->GetPropertyValue_InContainer(DynamicMeshActor) == 1) {
+                   MeshPosition -= FVector(CameraComp->GetRelativeLocation().X,CameraComp->GetRelativeLocation().Y, CameraComp->GetRelativeLocation().Z);
+                } else {
+                   MeshPosition -= FVector(CameraComp->GetRelativeLocation().X+65,CameraComp->GetRelativeLocation().Y, CameraComp->GetRelativeLocation().Z-10);
+                }
+             }
+    
+             // Teleport the User to our custom center
+             PlayerPawn->TeleportTo(MeshPosition,FRotator(0,0,0));
+             TpCenter->SetCheckedState(ECheckBoxState::Unchecked);
+          }
+       }
 
-         // Assign Texture to the Displacement Node of the Dynamic Mesh Blueprint
-         if (TextureProp) {
-            UE_LOG(LogTemp, Display, TEXT("Texture Updated"));
-            TextureProp->SetPropertyValue_InContainer(DynamicMeshActor, Depth);
-         }
-         
-         Depth->UpdateResource();
-         DynamicMaterialInstance->SetTextureParameterValue(TextureParameterName2, Depth);
-         DataQueue.Empty();
-         bPendingDepthUpdate = false;
-      }
-   }
+       // Check Latency Slider Value
+       if (LatencySlider && DynamicMaterialInstance) {
+          float Value = LatencySlider->GetValue();
+          // If Value as changed since last time
+          if (LastLatency != Value) {
+             Latency = FTimespan(Value * 10000000);
+             LatencyTime = FDateTime(1, 1, 1);
+             CamLocations.Empty();
+             CamRotations.Empty();
+             SpringLocations.Empty();
+             LatencyText->SetText(FText::AsNumber(Value));
+             LastLatency = Value;
+          }
+       }
+       
+       if (FixView && DynamicMeshActor) {
+          bool bValue = FixView->IsChecked();
+          if (bValue && PlayerPawn) {
+             if (LatencyTime == FDateTime(1, 1, 1)) {
+                LatencyTime = FDateTime::Now();
+             }
+             else {
+                if (FDateTime::Now() - LatencyTime > Latency)
+                {
+                   FVector NewLocationCam, NewLocationSpring, NewLocation;
+                   CamLocations.Dequeue(NewLocationCam);
+                   SpringLocations.Dequeue(NewLocationSpring);
+                   if (IsDepthSimuEnabled->GetPropertyValue_InContainer(DynamicMeshActor) == 1) {
+                      NewLocation = NewLocationCam;
+                   } else {
+                      NewLocation = NewLocationSpring;
+                   }
 
-   // If the IR Texture need to be updated
-   if (bPendingIRUpdate && DynamicMaterialInstance) {
-      IR->UpdateResource();
-      DynamicMaterialInstance->SetTextureParameterValue(TextureParameterName3, IR);
-      bPendingIRUpdate = false;
-   }
+                   FRotator NewRotationTemp;
+                   CamRotations.Dequeue(NewRotationTemp);
+                   FRotator NewRotation = FRotator(-NewRotationTemp.Roll, 90+NewRotationTemp.Yaw, 270+NewRotationTemp.Pitch); 
 
-   // Get the UI elements OR Update their value
-   if (!Slider || !MultiView || !RGBView || !DepthView || !IRView || !DepthSimu || !TpCenter)
-   {
-      if (PlayerPawn)
-      {
-         // Navigate through the Widget of the Pawn to find the UI
-         TArray<UWidgetComponent*> WidgetComponents;
-         PlayerPawn->GetComponents<UWidgetComponent>(WidgetComponents);
-         for (UWidgetComponent* WidgetComp : WidgetComponents)
-         {
-            FString name = WidgetComp->GetName();
-            if (WidgetComp->GetName().Contains(TEXT("Widget")))
-            {
-               UUserWidget* Widget = WidgetComp->GetUserWidgetObject();
-               if (!Widget) continue;
-
-               // Save all the useful Widgets
-               Slider = Cast<USlider>(Widget->GetWidgetFromName(TEXT("Slider_0")));
-               MultiView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("MultiViewCheckBox")));
-               RGBView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("RGBViewCheckBox")));
-               DepthView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("DepthViewCheckBox")));
-               IRView = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("IRViewCheckBox")));
-               DepthSimu = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("DepthSimuCheckBox")));
-               TpCenter = Cast<UCheckBox>(Widget->GetWidgetFromName(TEXT("TP")));
-               if (Slider && MultiView && RGBView && DepthView && IRView && DepthSimu && TpCenter)
-               {
-                  UE_LOG(LogTemp, Warning, TEXT("All UI Elements Found"));
-                  break;
-               }
-            }
-         }
-      }
-   }
-   else
-   {
-      // Check Slider Value
-      if (Slider && DynamicMaterialInstance) {
-         float Value = Slider->GetValue();
-         // If Value as changed since last time
-         if (LastBlendValue != Value) {
-            // Update the Dynamic Material accordingly to the Slider value
-            DynamicMaterialInstance->SetScalarParameterValue(BlendParameterName, Value);
-            LastBlendValue = Value;
-         }
-      }
-
-      // Check MultiView Checkbox
-      if (MultiView && DynamicMaterialInstance) {
-         bool Value = MultiView->IsChecked();
-         // If Checked as changed since last time
-         if (LastMultiView != Value) {
-            // Update the Dynamic Material accordingly to the Checkbox state
-            DynamicMaterialInstance->SetScalarParameterValue(MultiViewParameterName, Value);
-            LastMultiView = Value;
-         }
-      }
-
-      // Check RGB Checkbox
-      if (RGBView && DynamicMaterialInstance) {
-         bool Value = RGBView->IsChecked();
-         // If Checked as changed since last time
-         if (LastRGBView != Value) {
-            // Update the Dynamic Material accordingly to the Checkbox state
-            DynamicMaterialInstance->SetScalarParameterValue(RGBParameterName, Value);
-            LastRGBView = Value;
-         }
-      }
-
-      // Check Depth Checkbox
-      if (DepthView && DynamicMaterialInstance) {
-         bool Value = DepthView->IsChecked();
-         // If Checked as changed since last time
-         if (LastDepthView != Value) {
-            // Update the Dynamic Material accordingly to the Checkbox state
-            DynamicMaterialInstance->SetScalarParameterValue(DepthParameterName, Value);
-            LastDepthView = Value;
-         }
-      }
-
-      // Check IR Checkbox
-      if (IRView && DynamicMaterialInstance) {
-         bool Value = IRView->IsChecked();
-         // If Checked as changed since last time
-         if (LastIRView != Value) {
-            // Update the Dynamic Material accordingly to the Checkbox state
-            DynamicMaterialInstance->SetScalarParameterValue(IRParameterName, Value);
-            LastIRView = Value;
-         }
-      }
-
-      // Check Depth Simulation Checkbox
-      if (DepthSimu && DynamicMaterialInstance) {
-         bool Value = DepthSimu->IsChecked();
-         // If Checked as changed since last time
-         if (LastDepthSimu != Value) {
-            if (IsDepthSimuEnabled) {
-               // Update the Dynamic Material accordingly to the Checkbox state
-               IsDepthSimuEnabled->SetPropertyValue_InContainer(DynamicMeshActor, Value);
-            }
-            LastDepthSimu = Value;
-         }
-      }
-
-      // Check Teleport to Center Button (Hidden Checkbox)
-      if (TpCenter && DynamicMaterialInstance) {
-         bool Value = TpCenter->IsChecked();
-         if (Value && PlayerPawn) {
-            // Get the position of the Dynamic Mesh in the Scene
-            FVector MeshPosition = DynamicMeshActor->GetActorLocation();
-
-            // Get the position of the VR Headset in the Scene
-            TArray<UCameraComponent*> CameraComponents;
-            PlayerPawn->GetComponents<UCameraComponent>(CameraComponents);
-
-            // Compute the Mesh Position Minus the Camera Position to align the two elements
-            for (UCameraComponent* CameraComp : CameraComponents) {
-               MeshPosition -= FVector(CameraComp->GetRelativeLocation().X / 1.1f,CameraComp->GetRelativeLocation().Y, CameraComp->GetRelativeLocation().Z / 1.4f);
-            }
-
-            // Teleport the User to our custom center
-            PlayerPawn->TeleportTo(MeshPosition,FRotator(0,0,0));
-            TpCenter->SetCheckedState(ECheckBoxState::Unchecked);
-         }
-      }
-   }
+                   DynamicMeshActor->SetActorLocationAndRotation(NewLocation, NewRotation);
+                }
+             }
+             TArray<UCameraComponent*> CameraComponents;
+             TArray<USpringArmComponent*> SpringArmComponents;
+             PlayerPawn->GetComponents<UCameraComponent>(CameraComponents);
+             PlayerPawn->GetComponents<USpringArmComponent>(SpringArmComponents);
+                
+             if (CameraComponents.Num() > 0 && SpringArmComponents.Num() > 0) {
+                UCameraComponent* CameraComp = CameraComponents[0];
+                USpringArmComponent* SpringArmComp = SpringArmComponents[0];
+                CamLocations.Enqueue(CameraComp->GetComponentLocation() + FVector(10, 0, 0));
+                SpringLocations.Enqueue(SpringArmComp->GetComponentLocation());
+                CamRotations.Enqueue(CameraComp->GetComponentRotation());
+             }
+          } else {
+             // Reset position
+             if (IsDepthSimuEnabled->GetPropertyValue_InContainer(DynamicMeshActor) == 1) {
+                DynamicMeshActor->SetActorScale3D(FVector(0.1f, 0.1f, 0.1f));
+                DynamicMeshActor->SetActorLocation(FVector(-100, 0, 120));
+             } else {
+                DynamicMeshActor->SetActorScale3D(FVector(0.6f, -0.6f, 0.6f));
+                DynamicMeshActor->SetActorLocation(FVector(-100, 0, 80));
+             }
+             DynamicMeshActor->SetActorRotation(FRotator(0, 90, 270));
+          }
+       }
+    }
 }
 
   
@@ -575,7 +709,8 @@ void AROS2SubscriberNode::RGBCallback(const UROS2GenericMsg* InMsg) {
          UE_LOG(LogTemp, Error, TEXT("Failed to create texture"));
          return;
       }
-      Texture->SRGB = false;
+      Texture->SRGB = true;
+      Texture->AdjustRGBCurve = 2.2f;
       BGRADataTexture.Reserve(WidthDepth * HeightDepth * 4);
       Texture->UpdateResource();
    }
@@ -583,12 +718,16 @@ void AROS2SubscriberNode::RGBCallback(const UROS2GenericMsg* InMsg) {
    // Get the depth image sent by the Depth Filling Thread
    TSharedPtr<TArray<uint8>> DataCopy;
    if(Texture && MsgQueue2.Dequeue(DataCopy) && DataCopy.IsValid()){
+      MsgQueue2.Empty();
       // Unwrap the Message information inside an Unreal Engine variable
       RawDataTexture = Msg.Data;
       BGRADataTexture.Empty();
 
       // Create custom OpenCV image for the Depth and convert it to 16 bits using the inverse function of the Azure Kinect ROS Publisher
       cv::Mat depth_frame_buffer_mat(HeightDepth, WidthDepth, CV_32FC1, DataCopy->GetData());
+      if (IsDepthSimuEnabled->GetPropertyValue_InContainer(DynamicMeshActor) != 1) {
+         depth_frame_buffer_mat.setTo(1);
+      }
       cv::Mat new_image(HeightDepth, WidthDepth, CV_16UC1);
       depth_frame_buffer_mat.convertTo(new_image, CV_16UC1, 1000.0f);
       cv::Mat depth_uint16_contig = new_image.clone();
@@ -612,8 +751,25 @@ void AROS2SubscriberNode::RGBCallback(const UROS2GenericMsg* InMsg) {
       // Transform the RGB image into the Depth Frame
       k4a::image img = transformation.color_image_to_depth_camera(b2, b);
       cv::Mat transformed(img.get_height_pixels(), img.get_width_pixels(), CV_8UC4, img.get_buffer());
-      BGRADataTexture.SetNumUninitialized(transformed.rows * transformed.cols * 4);
-      FMemory::Memcpy(BGRADataTexture.GetData(), transformed.data, transformed.rows * transformed.cols * 4);
+
+      if (CamAbsoluteRotation != FRotator(0, 0, 0))
+      {
+         FQuat Quat = CamAbsoluteRotation.Quaternion();
+         FMatrix UnrealRotMatrix = FRotationMatrix::Make(Quat);
+         cv::Matx33f R;
+         for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+               R(row, col) = UnrealRotMatrix.M[row][col];  // transpose if needed depending on row-major / col-major
+         cv::Vec3f t(0.0f, -0.06f, -0.06f);
+         cv::Mat output = WarpFromCameraToEye(transformed, depth_uint16_contig, 503.23f, 503.305f, 523.143f, 513.149f, R, t);
+      
+         BGRADataTexture.SetNumUninitialized(output.rows * output.cols * 4);
+         FMemory::Memcpy(BGRADataTexture.GetData(), output.data, output.rows * output.cols * 4);
+      }else
+      {
+         BGRADataTexture.SetNumUninitialized(transformed.rows * transformed.cols * 4);
+         FMemory::Memcpy(BGRADataTexture.GetData(), transformed.data, transformed.rows * transformed.cols * 4);
+      }
 
       // Stores the data inside the Color Texture
       void* TextureData = Texture->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
@@ -657,6 +813,8 @@ void AROS2SubscriberNode::DepthCallback(const UROS2GenericMsg* InMsg) {
          return;
       }
       Depth->SRGB = false;
+      Depth->MipGenSettings = TMGS_NoMipmaps;
+      Depth->CompressionSettings = TC_HDR;
       BGRADataDepth.Reserve(WidthDepth * HeightDepth * 4);
       Depth->UpdateResource();
    }
@@ -666,7 +824,11 @@ void AROS2SubscriberNode::DepthCallback(const UROS2GenericMsg* InMsg) {
 
    // Add the Depth Image to the queue for further infill and use by Depth Infill Thread
    if (MsgQueue.IsEmpty())
+   {
+      std::lock_guard<std::mutex> lock(QueueMutex);
       MsgQueue.Enqueue(BGRADataDepth);
+      QueueCV.notify_all();
+   }
 } // Called when a Depth image is received
 void AROS2SubscriberNode::IRCallback(const UROS2GenericMsg* InMsg) {
    // Check if the received message is valid
@@ -720,4 +882,50 @@ void AROS2SubscriberNode::IRCallback(const UROS2GenericMsg* InMsg) {
       bPendingIRUpdate = true;
    }
 } // Called when an IR image is received
+void AROS2SubscriberNode::IMUCallback(const UROS2GenericMsg* InMsg) {
+   // Check if the received message is valid
+   if (!IsValid(this)) return;
+   if (!InMsg)    {
+      UE_LOG(LogTemp, Error, TEXT("Received null message!"));
+      return;
+   }
 
+   // Store the Message
+   const UROS2ImuMsg* ImuMsg = Cast<UROS2ImuMsg>(InMsg);
+   if (!ImuMsg) return;
+   FROSImu Msg;
+   ImuMsg->GetMsg(Msg);
+
+   FQuat Orientation;
+   float Alpha = 0.98f;
+   
+   FVector Accel = Msg.LinearAcceleration;
+   FVector Gyro = Msg.AngularVelocity;
+   float DeltaTime = 0.1f;
+
+   float Angle = Gyro.Size() * DeltaTime;
+   FVector Axis = Gyro.GetSafeNormal();
+
+   FQuat DeltaRot = FQuat(Axis, Angle);
+   Orientation = Orientation * DeltaRot;
+   Orientation.Normalize();
+
+   FVector GravityDir = Accel.GetSafeNormal();
+   FVector Up = -GravityDir;
+   
+   FVector Forward = FVector::CrossProduct(FVector::RightVector, Up).GetSafeNormal();
+   FMatrix AccRotationMatrix = FRotationMatrix::MakeFromXZ(Forward, Up);
+   FQuat AccQuat = FQuat(AccRotationMatrix);
+
+   Orientation = FQuat::Slerp(AccQuat, Orientation, Alpha);
+   Orientation.Normalize();
+   //CamAbsoluteRotation = Orientation.Rotator() * 100;
+
+   TArray<UCameraComponent*> CameraComponents;
+   PlayerPawn->GetComponents<UCameraComponent>(CameraComponents);
+            
+   // Compute the Mesh Position Minus the Camera Position to align the two elements
+   for (UCameraComponent* CameraComp : CameraComponents) {
+      //CamAbsoluteRotation = FRotator(-CamAbsoluteRotation.Roll, CamAbsoluteRotation.Yaw, CamAbsoluteRotation.Pitch);
+   }
+} // Called when an IMU information is received
