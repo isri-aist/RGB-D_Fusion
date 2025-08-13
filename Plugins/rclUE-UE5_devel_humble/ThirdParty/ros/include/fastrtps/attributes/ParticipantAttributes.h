@@ -36,7 +36,7 @@ class ParticipantAttributes
 public:
 
     //! DomainId to be used by the associated RTPSParticipant (default: 0)
-    uint32_t domainId = 0;
+    uint32_t domainId = 20;
 
     //!Attributes of the associated RTPSParticipant.
     rtps::RTPSParticipantAttributes rtps;

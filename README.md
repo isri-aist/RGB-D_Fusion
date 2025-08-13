@@ -14,6 +14,12 @@ This project uses a variety of sensor data to perform multiple operations, inclu
 - Depth Simulation using Displacement
 - A User Interface to control the view
 
+A Blueprint that inherit the DynamicMesh Class is used to create a Dynamic Mesh that allow a real-time displacement when provided with a DepthMap.
+![Alt text](Dynamic Blueprint.png?raw=true "Dynamic Mesh Blueprint")
+
+A Custom Material is also created to apply different images onto the Mesh. A Parralax Occlusion Mapping effect is also included to provided a pseudo-3D.
+![Alt text](Material.png?raw=true "Custom Material")
+
 ## Requirements
 
 This project has been tested in a specific environment:

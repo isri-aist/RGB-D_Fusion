@@ -111,6 +111,8 @@ void UROS2NodeComponent::Init()
         {
             Support = GetWorld()->GetGameInstance()->GetSubsystem<UROS2Subsystem>()->GetSupport();
 
+            rcl_node_options_t test = rcl_node_get_default_options();
+            
             UE_LOG_WITH_INFO_NAMED(LogROS2Node, Log, TEXT("rclc_node_init_default"));
             node = rcl_get_zero_initialized_node();
             RCSOFTCHECK(rclc_node_init_default(&node, TCHAR_TO_UTF8(*Name), TCHAR_TO_UTF8(*Namespace), &Support->Get()));

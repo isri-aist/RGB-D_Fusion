@@ -9,6 +9,7 @@
 #include "Kismet/GameplayStatics.h"
 #include "UObject/UnrealType.h"
 #include <fstream>
+#include <cstdlib>
 
 #include "HeadMountedDisplayTypes.h"
 #include "Components/WidgetComponent.h"
@@ -368,18 +369,19 @@ AROS2SubscriberNode::AROS2SubscriberNode()
 void AROS2SubscriberNode::BeginPlay()
 {
    Super::BeginPlay();
+   setenv("ROS_DOMAIN_ID", "20", 1);
    Node->Init();
-
+   
    // Get the Mesh from the Dynamic Actor
    DynamicMesh = DynamicMeshActor->GetDynamicMeshComponent();
-
+   
    if (DynamicMesh && BaseMaterial)
    {
       // Create the dynamic Material and assign it to the Mesh to dynamically change Texture
       DynamicMaterialInstance = UMaterialInstanceDynamic::Create(BaseMaterial, this);
       DynamicMesh->SetMaterial(0, DynamicMaterialInstance);
    }
-
+   
    // Load the calibration file of the Azure Kinect
    // Located at ~/Documents/Unreal Project/<Project name>/calibration.txt
    FString AbsolutePath = FPaths::ProjectDir()+ "calibration.txt";
@@ -391,7 +393,7 @@ void AROS2SubscriberNode::BeginPlay()
       std::string content((std::istreambuf_iterator<char>(rfile)),std::istreambuf_iterator<char>());
       calibFile = std::vector<uint8>(content.begin(), content.end());
       rfile.close();
-
+   
       // Initialise the calibration and transformation object from Azure SDK for RGB image transformation
       calib = k4a::calibration::get_from_raw(calibFile, K4A_DEPTH_MODE_WFOV_UNBINNED, K4A_COLOR_RESOLUTION_1536P);
       transformation = k4a::transformation(calib);
@@ -405,7 +407,7 @@ void AROS2SubscriberNode::BeginPlay()
       // Find dynamic variables of the Dynamic Mesh Blueprint
       TextureProp = FindFProperty<FObjectProperty>(DynamicMeshActor->GetClass(), "Displacement Map");
       IsDepthSimuEnabled = FindFProperty<FBoolProperty>(DynamicMeshActor->GetClass(), "DepthSimu");
-
+      
       // Current Player
       PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
        

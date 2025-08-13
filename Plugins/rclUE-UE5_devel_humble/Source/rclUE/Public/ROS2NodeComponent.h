@@ -671,7 +671,7 @@ protected:
 
     UPROPERTY()
     UROS2Support* Support;
-
+    
     rcl_node_t node;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
