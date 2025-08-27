@@ -62,7 +62,7 @@ public:
     FString IRTopicName = TEXT("k4a/ir/image_raw");
 	UPROPERTY(EditAnywhere, BlueprintReadWrite)
 	FString IMUTopicName = TEXT("k4a/imu");
-
+	
 	// Information about the Images
     UPROPERTY()
     int WidthTexture = 0;

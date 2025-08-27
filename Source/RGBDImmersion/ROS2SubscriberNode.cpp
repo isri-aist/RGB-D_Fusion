@@ -26,6 +26,8 @@
 #include <opencv2/photo.hpp>
 #endif
 
+#include <stdlib.h>
+
 /*----------------------------------------------------------------*/
 //			 			        Useful Functions 				            //
 /*----------------------------------------------------------------*/
@@ -369,7 +371,6 @@ AROS2SubscriberNode::AROS2SubscriberNode()
 void AROS2SubscriberNode::BeginPlay()
 {
    Super::BeginPlay();
-   setenv("ROS_DOMAIN_ID", "20", 1);
    Node->Init();
    
    // Get the Mesh from the Dynamic Actor
@@ -397,20 +398,20 @@ void AROS2SubscriberNode::BeginPlay()
       // Initialise the calibration and transformation object from Azure SDK for RGB image transformation
       calib = k4a::calibration::get_from_raw(calibFile, K4A_DEPTH_MODE_WFOV_UNBINNED, K4A_COLOR_RESOLUTION_1536P);
       transformation = k4a::transformation(calib);
-      
+       
       // Create all the Subscriber used to get the RGB, Depth and IR Stream
       ROS2_CREATE_SUBSCRIBER(Node, this, RGBTopicName, UROS2ImgMsg::StaticClass(), &AROS2SubscriberNode::RGBCallback);
       ROS2_CREATE_SUBSCRIBER(Node, this, DepthTopicName, UROS2ImgMsg::StaticClass(), &AROS2SubscriberNode::DepthCallback);
       ROS2_CREATE_SUBSCRIBER(Node, this, IRTopicName, UROS2ImgMsg::StaticClass(), &AROS2SubscriberNode::IRCallback);
       ROS2_CREATE_SUBSCRIBER(Node, this, IMUTopicName, UROS2ImuMsg::StaticClass(), &AROS2SubscriberNode::IMUCallback);
-      
+        
       // Find dynamic variables of the Dynamic Mesh Blueprint
       TextureProp = FindFProperty<FObjectProperty>(DynamicMeshActor->GetClass(), "Displacement Map");
       IsDepthSimuEnabled = FindFProperty<FBoolProperty>(DynamicMeshActor->GetClass(), "DepthSimu");
-      
+        
       // Current Player
       PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
-       
+         
       // Start the Thread used by the depth inpainting method to reduce lag
       InpaintThread = std::thread([this]() { InpaintDepth(); });
       //InpaintThread.detach();

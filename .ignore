@@ -1,0 +1,13 @@
+Saved
+.git
+DerivedDataCache
+Intermediate
+.idea
+.vscode
+Content
+Plugins/rclUE-UE5_devel_humble/.github
+Plugins/rclUE-UE5_devel_humble/ThirdParty
+Plugins/rclUE-UE5_devel_humble/Intermediate
+Plugins/rclUE-UE5_devel_humble/Content
+Plugins/mc_rtc_Unreal/Intermediate
+Plugins/mc_rtc_Unreal/Content
